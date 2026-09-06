@@ -86,3 +86,114 @@ server {
 - The `proxy_set_header` directives forward the original client information (host, IP) to the backend, since by default the Go app would otherwise only see requests coming from nginx itself.
 
   > NGINX forwards `Host`, `X-Real-IP`, and `X-Forwarded-For` headers to the backend, but the current Go application does not yet read or use them.
+
+## CI/CD with Github Actions
+
+This project uses GitHub Actions to automatically test, validate, and publish the Docker image whenever code is pushed to or when a pull request targets `main` branch.
+
+```yaml
+name: Go Basic Web API CI/CD Workflow
+run-name: Go Basic Web API CI/CD 
+on:
+  push:
+    branches:
+      - main
+      - deploy
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+      
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: go vet ./...
+
+  compose-test:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v2
+
+      - name: Docker Compose Up
+        run: docker compose -f compose.yaml up --build -d
+
+      - name: Test NGINX
+        run: |
+          sleep 10
+          curl -f http://localhost:80 || exit 1
+        
+      - name: Docker Compose Down
+        run: docker compose -f compose.yaml down
+      
+  build:
+    needs: compose-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: gesangwidigdo/go-basic-web-api
+```
+
+The pipeline runs three jobs in sequence, where each job only runs if the previous one succeeds:
+
+**1. `test`** validates the Go code itself, without Docker involved.
+- Checks out the repository and sets up Go.
+- Downloads dependencies with `go mod download`.
+- Runs `go vet ./...` to catch suspicious code patterns (e.g. incorrect format verbs, unreachable code) across the entire project.
+
+**2. `compose-test`** validates that the full containerized stack (Go app + nginx) actually works together.
+- Sets up Docker Compose on the runner.
+- Builds and starts both containers with `docker compose up --build -d`, using the same `compose.yaml` used locally.
+- Waits a few seconds for both containers to finish starting, then sends a real request through nginx with `curl`, confirming nginx correctly proxies to the Go app.
+- Tears down the stack afterward, regardless of whether the test passed or failed.
+
+**3. `build`** builds the final production image and publishes it to Docker Hub.
+- Logs in to Docker Hub using credentials stored as repository secrets.
+- Sets up QEMU and Buildx, enabling multi-platform image builds.
+- Builds the image from the project's `Dockerfile` and pushes it to Docker Hub under `gesangwidigdo/go-basic-web-api`.
+
+Because each job depends on the one before it (`compose-test` needs `test`; `build` needs `compose-test`), a broken Go file or a misconfigured `nginx.conf` will stop the pipeline before an image is ever built or pushed — only fully validated code reaches Docker Hub.
+
+### Required secrets
+
+For the `build` job to authenticate with Docker Hub, two repository secrets must be configured under **Settings → Secrets and variables → Actions**:
+
+| Secret | Description |
+|---|---|
+| `DOCKER_USERNAME` | Docker Hub username |
+| `DOCKER_PASSWORD` | Docker Hub access token (not the account password) |
